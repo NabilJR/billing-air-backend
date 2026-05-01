@@ -213,7 +213,7 @@ router.post('/', [
 });
 
 // Update bill (only current_reading for recalculation)
-router.patch('/:id/update-bill', [
+router.post('/:id/update-bill', [
   requireRole('admin', 'manager', 'staff')
 ], async (req, res) => {
   const pool = req.app.get('db');
