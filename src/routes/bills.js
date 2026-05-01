@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
+const { authMiddleware, requireRole } = require('../middleware/auth');
+
+// Apply auth middleware to all bill routes
+router.use(authMiddleware);
 
 // Get all bills
 router.get('/', async (req, res) => {
@@ -202,6 +206,105 @@ router.post('/', [
     );
 
     res.status(201).json({ bill: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update bill (only current_reading for recalculation)
+router.put('/:id', [
+  requireRole('admin', 'manager', 'staff')
+], async (req, res) => {
+  const pool = req.app.get('db');
+  const { current_reading } = req.body;
+
+  try {
+    // Get current bill data
+    const billResult = await pool.query(
+      'SELECT * FROM bills WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (billResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+
+    const bill = billResult.rows[0];
+
+    // Check if bill is paid
+    if (bill.status === 'paid') {
+      return res.status(400).json({ error: 'Cannot edit paid bills' });
+    }
+
+    // Validate current_reading
+    if (current_reading < bill.previous_reading) {
+      return res.status(400).json({ error: 'Current reading must be greater than or equal to previous reading' });
+    }
+
+    // Calculate new usage
+    const usage_cubic = parseFloat(current_reading) - parseFloat(bill.previous_reading);
+
+    // Get applicable tariff
+    const tariffResult = await pool.query(
+      `SELECT * FROM tariffs
+       WHERE customer_type = (SELECT customer_type FROM customers WHERE id = $1) AND is_active = true
+       AND effective_date <= $2
+       ORDER BY min_usage_cubic DESC
+       LIMIT 1`,
+      [bill.customer_id, bill.due_date]
+    );
+
+    if (tariffResult.rows.length === 0) {
+      return res.status(400).json({ error: 'No applicable tariff found' });
+    }
+
+    const tariff = tariffResult.rows[0];
+
+    // Calculate new water charge
+    let water_charge = 0;
+    let remaining_usage = usage_cubic;
+
+    // Get all tariffs for this customer type sorted by min usage (descending for tier calculation)
+    const allTariffs = await pool.query(
+      `SELECT * FROM tariffs
+       WHERE customer_type = (SELECT customer_type FROM customers WHERE id = $1) AND is_active = true
+       AND effective_date <= $2
+       ORDER BY min_usage_cubic DESC`,
+      [bill.customer_id, bill.due_date]
+    );
+
+    for (const t of allTariffs.rows) {
+      const nextTariff = allTariffs.rows[allTariffs.rows.indexOf(t) + 1];
+      const maxUsage = nextTariff ? nextTariff.min_usage_cubic - t.min_usage_cubic : remaining_usage;
+      const applicableUsage = Math.min(remaining_usage, maxUsage || remaining_usage);
+
+      water_charge += applicableUsage * parseFloat(t.price_per_cubic);
+      remaining_usage -= applicableUsage;
+
+      if (remaining_usage <= 0) break;
+    }
+
+    const admin_fee = parseFloat(tariff.admin_fee);
+    const late_fee = parseFloat(bill.late_fee || 0);
+    const other_charges = parseFloat(bill.other_charges || 0);
+    const total_amount = water_charge + admin_fee + late_fee + other_charges;
+
+    // Update bill
+    const result = await pool.query(
+      `UPDATE bills
+       SET current_reading = $1, usage_cubic = $2, water_charge = $3, total_amount = $4, updated_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [current_reading, usage_cubic, water_charge, total_amount, req.params.id]
+    );
+
+    // Update customer meter reading
+    await pool.query(
+      'UPDATE customers SET meter_reading = $1, updated_at = NOW() WHERE id = $2',
+      [current_reading, bill.customer_id]
+    );
+
+    res.json({ bill: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
