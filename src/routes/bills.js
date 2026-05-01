@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
+const { authMiddleware, requireRole } = require('../middleware/auth');
+
+// Apply auth middleware to all bill routes
+router.use(authMiddleware);
 
 // Get all bills
 router.get('/', async (req, res) => {
